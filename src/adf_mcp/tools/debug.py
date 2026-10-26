@@ -61,20 +61,25 @@ def _leaf_failures(client, target, run: dict, chain: list[str], depth: int = 0) 
     return leaves
 
 
-def _involved(live: LiveStore, cache: dict, pipeline: str, activity_name: str) -> dict:
-    """Datasets, linked services and IRs an activity uses, from the published definition."""
+def original_name(name: str) -> str:
+    """zz_mcp_debug_<name>_<hex6> -> <name>; other names unchanged."""
+    return name[len(DEBUG_PREFIX) :].rsplit("_", 1)[0] if name.startswith(DEBUG_PREFIX) else name
+
+
+def _involved(store, cache: dict, pipeline: str, activity_name: str) -> dict:
+    """Datasets, linked services and IRs an activity uses, from `store` (live, or Git for debug-run copies)."""
     key = ("pipeline", pipeline)
     if key not in cache:
-        cache[key] = live.get(KINDS["pipeline"], pipeline) or {}
+        cache[key] = store.get(KINDS["pipeline"], pipeline) or {}
     activity = find_activity(cache[key], activity_name) or {}
     refs = set(references(activity))
     for kind, name in list(refs):
         if kind == "dataset":
-            cache.setdefault(("dataset", name), live.get(KINDS["dataset"], name) or {})
+            cache.setdefault(("dataset", name), store.get(KINDS["dataset"], name) or {})
             refs |= references(cache[("dataset", name)])
     for kind, name in list(refs):
         if kind == "linkedService":
-            cache.setdefault(("linkedService", name), live.get(KINDS["linkedService"], name) or {})
+            cache.setdefault(("linkedService", name), store.get(KINDS["linkedService"], name) or {})
             ls = cache[("linkedService", name)]
             refs |= references(ls)
             refs.add(("integrationRuntime", (ls.get("connectVia") or {}).get("referenceName") or "AutoResolveIntegrationRuntime"))
@@ -249,7 +254,7 @@ def register(mcp: MCPServer) -> None:
         run = get_run(client, target, run_id)
         if run.get("status") != "Failed":
             return {"run": pipeline_run_view(run), "diagnosis": f"Run is {run.get('status')}, not Failed."}
-        live, cache = LiveStore(session, target), {}
+        live, cache, git_cache = LiveStore(session, target), {}, {}
         causes = []
         for leaf_run, activity, chain in _leaf_failures(client, target, run, []):
             error = activity.get("error") or {}
@@ -263,7 +268,14 @@ def register(mcp: MCPServer) -> None:
                 "hint": hint,
             }
             try:
-                cause["uses"] = _involved(live, cache, leaf_run.get("pipelineName"), activity.get("activityName"))
+                leaf_pipeline = leaf_run.get("pipelineName") or ""
+                if leaf_pipeline.startswith(DEBUG_PREFIX):
+                    # Debug-run copies are deleted after the run: read the Git version they were made from.
+                    cause["debug_copy_of"] = original_name(leaf_pipeline)
+                    store = resolve_store(session, target, "auto").store
+                    cause["uses"] = _involved(store, git_cache, cause["debug_copy_of"], activity.get("activityName"))
+                else:
+                    cause["uses"] = _involved(live, cache, leaf_pipeline, activity.get("activityName"))
             except AdfMcpError:
                 pass
             for key in ("runPageUrl", "effectiveIntegrationRuntime", "executionDuration"):

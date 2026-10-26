@@ -112,6 +112,29 @@ npx @modelcontextprotocol/inspector uv run python -m adf_mcp
 
 See [CLAUDE.md](CLAUDE.md) for the architecture, conventions and how to add a tool.
 
+## Known limitations
+
+| Limitation | Why | Workaround / alternative |
+|---|---|---|
+| No true ADF Studio **Debug** button | It uses a private API | `adf_pipeline_debug_run` publishes temporary `zz_mcp_debug_*` copies, runs them and deletes them. These copies appear briefly in the live factory and its run history, and need Data Factory Contributor. For zero footprint, point a profile at a separate sandbox factory and debug there. |
+| Debug runs can't copy integration runtimes or credentials | They are infrastructure, not definitions | Publish IR / credential changes first, or test in a sandbox factory |
+| Runs always use the **published** definition | ADF design | Debug-run the branch version, then merge and publish via ADF Studio or CI |
+| No **publish** tool | Publishing generates ARM templates (`adf_publish` branch / CI) | Use ADF Studio's Publish or CI with [`@microsoft/azure-data-factory-utilities`](https://www.npmjs.com/package/@microsoft/azure-data-factory-utilities) (`validate` / `export`). A future tool could wrap it. |
+| Pull requests aren't created, only linked | Needs Azure DevOps / GitHub credentials beyond Git | Open the returned `pull_request_url`, or use `az repos pr create` / `gh pr create` |
+| No **linked service "Test connection"** | No public API | Debug-run a small probe pipeline (GetMetadata / Lookup) on the linked service. `adf_diagnose_failure` classifies the result. |
+| Static validation is a subset of Studio's | Connector-specific `typeProperties` schemas aren't checked | Run `azure-data-factory-utilities validate` in CI. A debug run is the final check. |
+| Expressions aren't evaluated, only their references checked | No offline ADF expression engine | Debug-run the pipeline with real parameters, then inspect results with `adf_activity_io` |
+| Run history only 45 days | ADF retention | Enable diagnostic settings to Log Analytics (`ADFPipelineRun` etc.). Log Analytics tools are on the roadmap. |
+| Secrets come back masked from live | ADF security | Use Key Vault references / managed identity. Read definitions from Git. |
+| Data flow debug previews give no error details on failure; sessions take 3–6 min to start and are billed | ADF API | Find the real error with a probe pipeline. Keep `time_to_live_minutes` low and stop sessions when done. |
+| `adf_pipeline_edit` edits top-level activities only | Kept simple | For activities nested in ForEach / If / Switch, send the whole pipeline with `adf_resource_upsert` |
+| Trigger rerun works for tumbling-window triggers only | ADF only supports rerun for those | For schedule / event triggers, use `adf_pipeline_run` with the same parameters |
+| Long waits keep the tool call open | MCP calls are synchronous | Pass `wait_seconds=0`, then poll with `adf_run_wait` |
+| A Git clone is shared by every session that uses it | One working tree | Use one clone (or `git worktree`) per concurrent session |
+| Large factories: validation and graph load every definition per call | No cache yet | Filter by `kind`, or validate a branch `ref` in CI |
+| Admin and cost aren't implemented | Out of v1 scope | Azure portal / `az datafactory` for IRs, managed VNet, global parameters. Cost Management or a cost MCP for spend. |
+| Local only: browser sign-in opens on the machine running the server | stdio design | Use `device_code` for remote shells, `service_principal_*` / `managed_identity` for automation |
+
 ## Roadmap
 
 - Admin toolset: integration runtime management, managed VNet and private endpoints, global parameters, credentials

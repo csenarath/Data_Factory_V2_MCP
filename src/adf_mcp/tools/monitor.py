@@ -18,7 +18,7 @@ from ..compact import (
 )
 from ..errors import AdfMcpError, handle_errors
 from ..guards import audit, check_write
-from ._common import ctx, failed_activities, get_run, query_activity_runs, query_pipeline_runs
+from ._common import DEBUG_PREFIX, ctx, failed_activities, get_run, query_activity_runs, query_pipeline_runs
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 MAX_TREE_NODES = 100
@@ -114,7 +114,8 @@ def register(mcp: MCPServer) -> None:
         factory_name: str | None = None,
         resource_group: str | None = None,
     ) -> dict:
-        """Show the input, output and error of one activity run (the last attempt if it retried). Large payloads are truncated."""
+        """Show the input, output and error of one activity run. If it ran several times (retries, or inside a ForEach/Until),
+        the last run is shown; pass activity_run_id for a specific one. Large payloads are truncated."""
         if not activity_name and not activity_run_id:
             raise AdfMcpError("bad_argument", "Pass activity_name or activity_run_id.")
         _, target, client = ctx(factory_name, resource_group)
@@ -127,7 +128,7 @@ def register(mcp: MCPServer) -> None:
         activity = items[-1]
         return {
             **activity_run_view(activity, error_chars=max_chars),
-            "attempts": len(items),
+            "runs_with_this_name": len(items),  # retries and loop iterations both count
             "input": truncate(activity.get("input"), max_chars),
             "output": truncate(activity.get("output"), max_chars),
             "user_properties": activity.get("userProperties") or None,
@@ -183,7 +184,11 @@ def register(mcp: MCPServer) -> None:
         runs, more = query_pipeline_runs(client, target, body, 500)
 
         by_pipeline: dict[str, list[dict]] = {}
+        debug_runs = 0
         for run in runs:  # newest first
+            if (run.get("pipelineName") or "").startswith(DEBUG_PREFIX):
+                debug_runs += 1  # temporary adf_pipeline_debug_run copies are not factory failures
+                continue
             by_pipeline.setdefault(run.get("pipelineName"), []).append(run)
 
         failing = []
@@ -220,6 +225,7 @@ def register(mcp: MCPServer) -> None:
             "factory": target.factory_name,
             "window": {"from": after, "to": before},
             "runs_scanned": len(runs),
+            "debug_runs_excluded": debug_runs,
             "scan_truncated": more,
             "status_counts": dict(Counter(r.get("status") for r in runs)),
             "failing_pipelines": len(failing),

@@ -105,7 +105,7 @@ def test_run_tree_walks_up_then_down(factory, call):
 def test_activity_io_truncates(factory, call):
     result = call("adf_activity_io", run_id="child", activity_name="copy_sales", max_chars=20)
     assert "truncated" in result["input"]
-    assert result["attempts"] == 1
+    assert result["runs_with_this_name"] == 1
 
 
 def test_cancel_only_in_progress_and_audited(factory, call, call_error, isolated_home):
@@ -143,3 +143,17 @@ def test_paginate_follows_continuation_tokens():
 def test_time_window_caps_at_45_days():
     start, end = time_window(24 * 90, None, "2026-10-26T00:00:00Z")
     assert start.startswith("2026-09-11")
+
+
+def test_failures_summary_excludes_debug_copies(factory, call):
+    factory.runs["dbg"] = run("dbg", "zz_mcp_debug_pl_export_a1b2c3", "Failed", start="2026-10-26T05:00:00Z")
+    result = call("adf_failures_summary")
+    assert result["debug_runs_excluded"] == 1
+    assert all(not p["pipeline"].startswith("zz_mcp_debug_") for p in result["pipelines"])
+
+
+def test_original_name_of_debug_copy():
+    from adf_mcp.tools.debug import original_name
+
+    assert original_name("zz_mcp_debug_pl_load_sales_a1b2c3") == "pl_load_sales"
+    assert original_name("pl_load_sales") == "pl_load_sales"
