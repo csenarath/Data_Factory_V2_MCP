@@ -1,0 +1,45 @@
+# Copy to ~/.adf-mcp/profiles.yaml (or point ADF_MCP_PROFILES at it).
+# Never put secrets here: service principal secrets come from the env var named in client_secret_env.
+#
+# A Claude session starts on ADF_MCP_PROFILE (set per MCP server entry), else default_profile,
+# and can switch at runtime with adf_profile_use. Sessions never share the active profile.
+
+default_profile: dev
+
+profiles:
+  dev:
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    subscription_id: 00000000-0000-0000-0000-000000000000
+    resource_group: rg-data-dev
+    factory_name: adf-dev
+    auth_method: browser            # user sign-in; call adf_login once, then cached per tenant
+    environment: dev
+    # authoring_target: auto        # auto | git | live  (auto = git when the factory is Git-connected)
+    # git:
+    #   repo_path: C:/repos/data-platform   # local clone used for Git-mode authoring
+    #   branch_prefix: adf-mcp/
+
+  prod:
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    subscription_id: 00000000-0000-0000-0000-000000000000
+    resource_group: rg-data-prod
+    factory_name: adf-prod
+    auth_method: azure_cli          # reuse `az login`
+    environment: prod               # writes blocked unless allow_prod_writes: true
+    read_only: true
+
+  other-tenant-automation:
+    tenant_id: 11111111-1111-1111-1111-111111111111
+    subscription_id: 11111111-1111-1111-1111-111111111111
+    resource_group: rg-etl
+    factory_name: adf-etl
+    auth_method: service_principal_secret   # machine auth
+    client_id: 22222222-2222-2222-2222-222222222222
+    client_secret_env: ADF_ETL_CLIENT_SECRET
+    environment: test
+
+# Other auth_method values:
+#   device_code                    user sign-in via code (headless / remote shells)
+#   service_principal_certificate  needs client_id + certificate_path (+ certificate_password_env)
+#   managed_identity               optional client_id for a user-assigned identity
+#   workload_identity              federated credentials (AZURE_FEDERATED_TOKEN_FILE etc.)

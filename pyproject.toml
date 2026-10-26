@@ -1,0 +1,39 @@
+[project]
+name = "adf-mcp"
+version = "0.1.0"
+description = "MCP server for Azure Data Factory (ADF v2): monitoring, debugging, authoring and admin across tenants"
+readme = "README.md"
+authors = [
+    { name = "csenarath", email = "40589106+csenarath@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anyio",
+    "azure-identity",
+    "azure-mgmt-datafactory",
+    "mcp[cli]",
+    "pydantic",
+    "pyyaml",
+]
+
+[project.scripts]
+adf-mcp = "adf_mcp:main"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits a real Azure Data Factory (needs a configured dev profile)"]
+addopts = "-m 'not live'"

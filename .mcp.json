@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "adf": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--quiet", "python", "-m", "adf_mcp"],
+      "env": {
+        "ADF_MCP_PROFILE": "${ADF_MCP_PROFILE:-}",
+        "ADF_MCP_TOOLSETS": "${ADF_MCP_TOOLSETS:-all}"
+      }
+    }
+  }
+}
