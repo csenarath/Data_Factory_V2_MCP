@@ -1,6 +1,6 @@
 """Toolsets. Each module exposes ``register(mcp)``; ADF_MCP_TOOLSETS selects which load."""
 
-from . import authoring, context, debug, health, monitor, triggers
+from . import admin, authoring, context, cost, debug, health, monitor, triggers
 
 TOOLSETS = {
     "context": context.register,
@@ -9,5 +9,7 @@ TOOLSETS = {
     "authoring": authoring.register,
     "triggers": triggers.register,
     "debug": debug.register,
+    "admin": admin.register,
+    "cost": cost.register,
 }
 ALWAYS_ON = {"context"}

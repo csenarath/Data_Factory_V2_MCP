@@ -25,19 +25,19 @@ Out of scope: **Microsoft Fabric** Data Factory (different API, `api.fabric.micr
 
 ## Status
 
-| Toolset | State |
-|---|---|
-41 tools in 6 toolsets, all verified live against `mcp-adf-oct-test` + its Azure DevOps repo (2026-10-27).
+56 tools in 8 toolsets.
 
 | Toolset | Tools |
 |---|---|
-| `context` | profiles_list, profile_use, context, context_set, login, logout, factories_list |
+| `context` | profiles_list, profile_use, context, context_set, login, logout, factories_list, job_status, jobs_list |
 | `monitor` | runs_query, run_get, activity_runs, activity_io, trigger_runs, failures_summary, run_tree, run_cancel |
 | `health` | dependency_graph, validate, drift, factory_health |
-| `authoring` | resource_list/get/upsert/delete (all kinds), pipeline_edit, resource_template, git_status/checkout/sync/push |
+| `authoring` | resource_list/get/upsert/delete (all kinds), pipeline_edit, resource_template, global_parameters, publish, git_status/checkout/sync/push |
 | `triggers` | triggers_list, trigger_start, trigger_stop, trigger_rerun |
-| `debug` | pipeline_run, run_rerun, run_wait, diagnose_failure, pipeline_debug_run, debug_cleanup, dataflow_debug_session, dataflow_debug_preview |
-| v2 | admin (IR management, managed VNet / private endpoints, global parameters, credentials), cost, Log Analytics |
+| `debug` | pipeline_run, run_rerun, run_wait, diagnose_failure, pipeline_debug_run, linked_service_test, debug_cleanup, dataflow_debug_session, dataflow_debug_preview |
+| `admin` | factory_info, factory_update, access_check, diagnostic_settings, integration_runtimes, integration_runtime_control, integration_runtime_keys, managed_network, managed_private_endpoint |
+| `cost` | cost_report |
+| roadmap | Log Analytics history, PR creation, ARM export |
 
 ## Commands
 
@@ -79,9 +79,14 @@ src/adf_mcp/
   checks.py        # static validation rules + FactoryModel (reference graph)
   diagnose.py      # error classification rules for adf_diagnose_failure
   templates.py     # starter definitions for adf_resource_template
+  jobs.py          # background jobs: run_job() returns within ADF_MCP_MAX_WAIT_SECONDS or hands back a job_id
+  tempdeploy.py    # temporary zz_mcp_debug_* deployments (debug runs, connection probes)
+  probes.py        # connection-test probe per linked service type
+  publishing.py    # publish plan (Git vs live diff, dependency order, triggers) and apply
+  pricing.py       # Azure Retail Prices (cached 24h) + billingReference meter mapping
   tools/__init__.py  # TOOLSETS registry
   tools/_common.py   # ctx(), run queries, wait_for_run
-  tools/{context,monitor,health,authoring,triggers,debug}.py
+  tools/{context,monitor,health,authoring,triggers,debug,admin,cost}.py
 tests/             # conftest.py has FakeAdf / FakeSession; tests call tools through MCPServer.call_tool;
                    # test_git_authoring.py uses a real temp repo with a bare origin
 profiles.example.yaml
@@ -98,6 +103,8 @@ profiles.example.yaml
    live both work.
 4. Any write: `check_write(target, "...")` first, `audit(...)` after success. Definition writes must also go
    through `authoring_mode()`.
+   Anything that can take more than a few seconds runs through `run_job()` (never block a call past
+   `bounded()`); waits on ADF runs use `wait_for_run(..., bounded(wait_seconds))`.
 5. Return compact dicts (see `compact.py`), never raw ARM lists. The SDK models' `.as_dict()` gives REST-shaped
    camelCase JSON; request bodies can be plain dicts in REST shape.
 6. Add a test using `FakeAdf` / `FakeSession`. A new toolset module must be added to `tools/__init__.py`.

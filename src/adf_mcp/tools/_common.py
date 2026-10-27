@@ -10,8 +10,7 @@ from azure.mgmt.datafactory import DataFactoryManagementClient
 from ..compact import activity_run_view, paginate, parse_time, run_filters
 from ..session import Session, Target, get_session
 
-TERMINAL = {"Succeeded", "Failed", "Cancelled"}
-DEBUG_PREFIX = "zz_mcp_debug_"  # temporary copies published by adf_pipeline_debug_run
+from ..tempdeploy import DEBUG_PREFIX, TERMINAL  # noqa: F401  (re-exported for toolsets)
 
 
 def ctx(factory_name: str | None, resource_group: str | None) -> tuple[Session, Target, DataFactoryManagementClient]:

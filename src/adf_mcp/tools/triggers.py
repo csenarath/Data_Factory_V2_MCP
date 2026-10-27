@@ -21,8 +21,12 @@ def _schedule(props: dict) -> str | None:
     rec = tp.get("recurrence") or (tp if props.get("type") == "TumblingWindowTrigger" else None)
     if rec:
         text = f"every {rec.get('interval')} {rec.get('frequency')}"
-        if rec.get("schedule"):
-            text += f" at {rec['schedule']}"
+        schedule = rec.get("schedule") or {}
+        if schedule.get("hours") or schedule.get("minutes"):
+            times = [f"{h:02d}:{m:02d}" for h in schedule.get("hours") or [0] for m in schedule.get("minutes") or [0]]
+            text += " at " + ", ".join(times[:6]) + (" …" if len(times) > 6 else "")
+        if schedule.get("weekDays"):
+            text += f" on {', '.join(schedule['weekDays'])}"
         return text + (f" ({rec['timeZone']})" if rec.get("timeZone") else "")
     if props.get("type") in EVENT_TRIGGERS:
         return f"on {', '.join(tp.get('events') or [])} {tp.get('blobPathBeginsWith') or ''}".strip()

@@ -119,6 +119,25 @@ class GitRepo:
         except json.JSONDecodeError as exc:
             raise AdfMcpError("git_error", f"{self.rel(kind, name)} at {ref or 'working tree'} is not valid JSON: {exc}") from exc
 
+    def factory_document(self, factory_name: str, ref: str | None = None) -> dict | None:
+        """factory/<name>.json (holds global parameters), or None if the repo has none."""
+        rel = "/".join(p for p in (self.root, "factory", f"{factory_name}.json") if p)
+        if ref is None:
+            file = self.path / rel
+            return json.loads(file.read_text(encoding="utf-8-sig")) if file.exists() else None
+        out = self.git("show", f"{ref}:{rel}", check=False)
+        return json.loads(out.lstrip("﻿")) if out.strip() else None
+
+    def write_factory_document(self, factory_name: str, document: dict) -> str:
+        rel = "/".join(p for p in (self.root, "factory", f"{factory_name}.json") if p)
+        file = self.path / rel
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps(document, indent="\t", ensure_ascii=False), encoding="utf-8", newline="\n")
+        return rel
+
+    def head(self, ref: str) -> str:
+        return self.git("rev-parse", "--short", ref).strip()
+
     # -- writes ---------------------------------------------------------------------
 
     def ensure_branch(self, branch: str) -> bool:

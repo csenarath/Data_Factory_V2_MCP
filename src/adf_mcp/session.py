@@ -17,6 +17,7 @@ from azure.mgmt.datafactory import DataFactoryManagementClient
 from .auth import ARM_SCOPE, DeviceCodeFlow, build_credential, credential_key, delete_record, save_record
 from .config import AuthMethod, Profile, ProfilesFile, initial_profile_name, load_profiles
 from .errors import AdfMcpError
+from .jobs import Jobs
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class Session:
         self.device_flows: dict[str, DeviceCodeFlow] = {}
         # Misc per-session objects (Git repos, ...), keyed by the module that owns them.
         self.cache: dict = {}
+        self.jobs = Jobs()
         # Re-entrant: client() takes the lock and then calls credential(), which takes it again.
         self._lock = threading.RLock()
 

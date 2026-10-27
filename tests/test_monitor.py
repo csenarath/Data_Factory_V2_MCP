@@ -153,7 +153,7 @@ def test_failures_summary_excludes_debug_copies(factory, call):
 
 
 def test_original_name_of_debug_copy():
-    from adf_mcp.tools.debug import original_name
+    from adf_mcp.tempdeploy import original_name
 
     assert original_name("zz_mcp_debug_pl_load_sales_a1b2c3") == "pl_load_sales"
     assert original_name("pl_load_sales") == "pl_load_sales"

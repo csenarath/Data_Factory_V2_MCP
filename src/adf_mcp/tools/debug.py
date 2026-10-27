@@ -9,7 +9,6 @@ adf_pipeline_debug_run bridges that: it publishes the Git (or supplied) version 
 from __future__ import annotations
 
 import json
-import secrets
 import time
 
 from azure.core.exceptions import ResourceNotFoundError
@@ -21,13 +20,15 @@ from ..compact import activity_run_view, pipeline_run_view, truncate
 from ..diagnose import classify
 from ..errors import AdfMcpError, handle_errors
 from ..guards import audit, authoring_mode, check_write
-from ..resources import KINDS, REFERENCE_TYPES, find_activity, references, same_definition
+from ..jobs import bounded, run_job
+from ..probes import PROBE_DATASET, build_probe
+from ..resources import KINDS, find_activity, references, same_definition
 from ..stores import GitStore, LiveStore, Source, git_repo, resolve_store
-from ._common import DEBUG_PREFIX, TERMINAL, ctx, failed_activities, get_run, query_activity_runs, wait_for_run
+from ..tempdeploy import DEBUG_PREFIX, TempPlan, debug_copies, execute, original_name
+from ._common import TERMINAL, ctx, failed_activities, get_run, query_activity_runs, wait_for_run
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 RUN = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
-DEBUG_FOLDER = "_mcp_debug"
 
 
 def _outcome(client, target, run: dict) -> dict:
@@ -36,6 +37,7 @@ def _outcome(client, target, run: dict) -> dict:
         view["failed_activities"] = failed_activities(client, target, run)
     elif run.get("status") not in TERMINAL:
         view["still_running"] = True
+        view["next"] = f"Call adf_run_wait run_id={run.get('runId')} to keep waiting."
     return view
 
 
@@ -61,11 +63,6 @@ def _leaf_failures(client, target, run: dict, chain: list[str], depth: int = 0) 
     return leaves
 
 
-def original_name(name: str) -> str:
-    """zz_mcp_debug_<name>_<hex6> -> <name>; other names unchanged."""
-    return name[len(DEBUG_PREFIX) :].rsplit("_", 1)[0] if name.startswith(DEBUG_PREFIX) else name
-
-
 def _involved(store, cache: dict, pipeline: str, activity_name: str) -> dict:
     """Datasets, linked services and IRs an activity uses, from `store` (live, or Git for debug-run copies)."""
     key = ("pipeline", pipeline)
@@ -84,61 +81,6 @@ def _involved(store, cache: dict, pipeline: str, activity_name: str) -> dict:
             refs |= references(ls)
             refs.add(("integrationRuntime", (ls.get("connectVia") or {}).get("referenceName") or "AutoResolveIntegrationRuntime"))
     return {"resources": sorted(fmt(r) for r in refs if r[0] != "pipeline"), "policy": activity.get("policy")}
-
-
-COPYABLE = ("pipeline", "dataflow", "dataset", "linkedService")  # IRs and credentials must already be published
-
-
-def _debug_copies(git: GitStore, live: LiveStore, root: tuple[str, str]) -> tuple[list[tuple[str, str]], list[str]]:
-    """Resources that need a temporary published copy for `root` to run as it is in Git.
-
-    A resource needs a copy if its Git version is missing in or differs from live, or if anything it
-    references needs a copy (so the copy can point at the other copies). Returns them dependencies-first,
-    plus references that can't be satisfied (missing in both Git and live, or non-copyable kinds missing live).
-    """
-    need: dict[tuple[str, str], bool] = {}
-    order: list[tuple[str, str]] = []
-    unresolved: list[str] = []
-
-    def visit(ref: tuple[str, str], stack: frozenset) -> bool:
-        if ref in need:
-            return need[ref]
-        if ref in stack:  # reference cycle: treat as not needing a copy
-            return False
-        kind, name = ref
-        if kind not in COPYABLE:
-            if ref != ("integrationRuntime", "AutoResolveIntegrationRuntime") and live.get(KINDS[kind], name) is None:
-                unresolved.append(f"{kind}:{name}")
-            need[ref] = False
-            return False
-        git_def = git.get(KINDS[kind], name)
-        if git_def is None:
-            if live.get(KINDS[kind], name) is None:
-                unresolved.append(f"{kind}:{name}")
-            need[ref] = False
-            return False
-        children = [visit(child, stack | {ref}) for child in sorted(references(git_def))]
-        changed = ref == root or not same_definition(git_def, live.get(KINDS[kind], name))
-        need[ref] = changed or any(children)
-        if need[ref]:
-            order.append(ref)
-        return need[ref]
-
-    visit(root, frozenset())
-    return order, unresolved
-
-
-def _rewrite(definition, renames: dict[tuple[str, str], str]):
-    """Point references at temporary copies."""
-    if isinstance(definition, dict):
-        out = {k: _rewrite(v, renames) for k, v in definition.items()}
-        kind = REFERENCE_TYPES.get(definition.get("type")) if isinstance(definition.get("type"), str) else None
-        if kind and (kind, definition.get("referenceName")) in renames:
-            out["referenceName"] = renames[(kind, definition["referenceName"])]
-        return out
-    if isinstance(definition, list):
-        return [_rewrite(v, renames) for v in definition]
-    return definition
 
 
 def _debug_package(store, dataflow: str, row_limit: int) -> tuple[dict, list[str]]:
@@ -182,7 +124,8 @@ def register(mcp: MCPServer) -> None:
         factory_name: str | None = None,
         resource_group: str | None = None,
     ) -> dict:
-        """Trigger a run of the published pipeline. wait_seconds>0 waits for the outcome (with failed activities).
+        """Trigger a run of the published pipeline. wait_seconds>0 waits (at most ~50s per call) for the outcome;
+        if it is still running, poll with adf_run_wait.
         Git factories: warns if the Git working-tree version differs from what will run (use adf_pipeline_debug_run)."""
         session, target, client = ctx(factory_name, resource_group)
         check_write(target, "Run pipeline")
@@ -199,7 +142,7 @@ def register(mcp: MCPServer) -> None:
         audit(target, "pipeline_run", f"pipeline/{pipeline}", {"run_id": run_id})
         out["run_id"] = run_id
         if wait_seconds > 0:
-            out["run"] = _outcome(client, target, wait_for_run(client, target, run_id, wait_seconds))
+            out["run"] = _outcome(client, target, wait_for_run(client, target, run_id, bounded(wait_seconds)))
         return out
 
     @mcp.tool(annotations=RUN)
@@ -232,17 +175,18 @@ def register(mcp: MCPServer) -> None:
         audit(target, "pipeline_rerun", f"pipeline/{original['pipelineName']}", {"of": run_id, "mode": mode, "run_id": new_id})
         out: dict = {"run_id": new_id, "rerun_of": run_id, "mode": mode, "pipeline": original["pipelineName"]}
         if wait_seconds > 0:
-            out["run"] = _outcome(client, target, wait_for_run(client, target, new_id, wait_seconds))
+            out["run"] = _outcome(client, target, wait_for_run(client, target, new_id, bounded(wait_seconds)))
         return out
 
     @mcp.tool(annotations=READ)
     @handle_errors
     def adf_run_wait(
-        run_id: str, timeout_seconds: int = 300, factory_name: str | None = None, resource_group: str | None = None
+        run_id: str, timeout_seconds: int = 45, factory_name: str | None = None, resource_group: str | None = None
     ) -> dict:
-        """Wait for a pipeline run to finish (polls every 5s up to timeout_seconds) and return its outcome."""
+        """Wait for a pipeline run to finish (polls every 5s, at most ~50s per call) and return its outcome.
+        If it is still running the result says so; call again to keep waiting."""
         _, target, client = ctx(factory_name, resource_group)
-        return _outcome(client, target, wait_for_run(client, target, run_id, min(timeout_seconds, 3600)))
+        return _outcome(client, target, wait_for_run(client, target, run_id, bounded(timeout_seconds)))
 
     @mcp.tool(annotations=READ)
     @handle_errors
@@ -298,7 +242,8 @@ def register(mcp: MCPServer) -> None:
         ref: str | None = None,
         properties: dict | None = None,
         with_dependencies: bool = False,
-        wait_seconds: int = 600,
+        wait_seconds: int = 45,
+        run_wait_seconds: int = 1800,
         keep: bool = False,
         factory_name: str | None = None,
         resource_group: str | None = None,
@@ -308,29 +253,27 @@ def register(mcp: MCPServer) -> None:
         By default, referenced child pipelines, data flows, datasets and linked services run as published.
         with_dependencies=true also publishes temporary copies of every referenced resource that is new or changed
         in Git (references rewritten to the copies), so a whole branch change can be tested before merge.
+        Runs as a background job: returns within wait_seconds (capped ~50s) with the result or a job_id for
+        adf_job_status; the job keeps waiting up to run_wait_seconds and always cleans up the copies.
         Blocked on read-only/prod profiles."""
         session, target, client = ctx(factory_name, resource_group)
         check_write(target, "Debug run")
         live = LiveStore(session, target)
-        suffix = secrets.token_hex(3)
         root = ("pipeline", pipeline)
-        temp_name = lambda name: f"{DEBUG_PREFIX}{name}"[:130] + f"_{suffix}"  # noqa: E731
-
         if properties is not None:
-            plan, definitions, unresolved = [root], {root: properties}, []
+            plan = TempPlan(root, [root], {root: properties})
+            not_copied: list[str] = []
         else:
             if authoring_mode(session, target) != "git":
                 raise AdfMcpError("bad_argument", "This factory isn't Git-connected: pass `properties`, or use adf_pipeline_run.")
             git = GitStore(git_repo(session, target), ref)
             if git.get(KINDS["pipeline"], pipeline) is None:
                 raise AdfMcpError("not_found", f"pipeline '{pipeline}' not found in {git.label}.")
-            plan, unresolved = _debug_copies(git, live, root)
+            needed, unresolved = debug_copies(git, live, root)
             if unresolved:
                 raise AdfMcpError("unresolved_references", f"Can't debug-run: {unresolved} exist neither in Git nor live.")
-            definitions = {ref_: git.get(KINDS[ref_[0]], ref_[1]) for ref_ in plan}
-        copies = plan if with_dependencies else [root]
-        not_copied = [fmt(r) for r in plan if r not in copies]
-        if not with_dependencies:
+            copies = needed if with_dependencies else [root]
+            not_copied = [fmt(r) for r in needed if r not in copies]
             missing_live = [r for r in not_copied if live.get(KINDS[r.split(":")[0]], r.split(":", 1)[1]) is None]
             if missing_live:
                 raise AdfMcpError(
@@ -338,35 +281,97 @@ def register(mcp: MCPServer) -> None:
                     f"'{pipeline}' references {missing_live}, which exist only in Git.",
                     "Pass with_dependencies=true to publish temporary copies of them for this run.",
                 )
+            plan = TempPlan(root, copies, {r: git.get(KINDS[r[0]], r[1]) for r in copies})
 
-        renames = {r: temp_name(r[1]) for r in copies}
-        created: list[tuple[str, str]] = []
-        out: dict = {"pipeline": pipeline}
-        try:
-            for ref_ in copies:  # dependencies first
-                body = _rewrite(definitions[ref_], renames)
-                if ref_[0] in ("pipeline", "dataflow", "dataset"):
-                    body = {**body, "folder": {"name": DEBUG_FOLDER}}
-                live.put(KINDS[ref_[0]], renames[ref_], body)
-                created.append((ref_[0], renames[ref_]))
-            run_id = _start(client, target, renames[root], parameters)
-        except Exception:
-            for kind, name in reversed(created):
-                live.delete(KINDS[kind], name)
-            raise
-        audit(target, "pipeline_debug_run", f"pipeline/{pipeline}", {"temp_copies": [f"{k}:{n}" for k, n in created], "run_id": run_id})
-        out.update(run_id=run_id, temp_copies=[f"{k}:{n}" for k, n in created])
-        if not_copied:
-            out["running_published_versions_of"] = not_copied
-        run = wait_for_run(client, target, run_id, min(wait_seconds, 3600)) if wait_seconds > 0 else get_run(client, target, run_id)
-        out["run"] = _outcome(client, target, run)
-        if run.get("status") in TERMINAL and not keep:
-            for kind, name in reversed(created):
-                live.delete(KINDS[kind], name)
-            out["temp_copies_deleted"] = True
+        def job(j):
+            out = execute(j, session, target, plan, parameters, run_wait_seconds, keep, "pipeline_debug_run")
+            if not_copied:
+                out["running_published_versions_of"] = not_copied
+            return {"pipeline": pipeline, **out}
+
+        return run_job(session.jobs, "debugrun", f"debug run of {pipeline}", job, wait_seconds)
+
+    @mcp.tool(annotations=RUN)
+    @handle_errors
+    def adf_linked_service_test(
+        name: str,
+        path: str | None = None,
+        linked_service_parameters: dict | None = None,
+        source: Source = "auto",
+        ref: str | None = None,
+        wait_seconds: int = 45,
+        factory_name: str | None = None,
+        resource_group: str | None = None,
+    ) -> dict:
+        """Test a linked service's connection (ADF Studio's "Test connection" has no public API).
+
+        Runs a tiny probe pipeline as a temporary debug run: `SELECT 1` for SQL-family stores, GetMetadata(exists)
+        on `path` for storage (path starts with the container/file system, e.g. 'raw' or 'raw/in'), an
+        authenticated GET for Key Vault / Databricks (managed identity) / REST; otherwise through a dataset that
+        uses it. Works on the unpublished Git version too. Returns connected true/false with the classified error.
+        """
+        session, target, client = ctx(factory_name, resource_group)
+        check_write(target, "Linked service test")
+        resolved = resolve_store(session, target, source, ref)
+        store, live = resolved.store, LiveStore(session, target)
+        ls = (KINDS["linkedService"], name)
+        definition = store.get(*ls)
+        if definition is None:
+            raise AdfMcpError("not_found", f"linkedService '{name}' not found in {store.label}.")
+        datasets_using = sorted(
+            ds for ds, d in store.list_definitions(KINDS["dataset"]).items() if ("linkedService", name) in references(d)
+        )
+        probe = build_probe(name, definition, path, linked_service_parameters, datasets_using)
+
+        # What must be published temporarily: changed Git versions of the linked service (and what it uses).
+        root = ("pipeline", f"probe_{name}")
+        if isinstance(store, GitStore):
+            start = ("dataset", probe.existing_dataset) if probe.existing_dataset else ("linkedService", name)
+            copies, unresolved = debug_copies(store, live, start)
+            if unresolved:
+                raise AdfMcpError("unresolved_references", f"Can't test: {unresolved} exist neither in Git nor live.")
+            if not probe.existing_dataset and same_definition(definition, live.get(*ls)) and copies == [("linkedService", name)]:
+                copies = []  # published version is identical: probe it directly
+            definitions = {r: store.get(KINDS[r[0]], r[1]) for r in copies}
         else:
-            out["cleanup"] = "Call adf_debug_cleanup after the run finishes to delete the temporary copies."
-        return out
+            copies, definitions = [], {}
+        if probe.dataset is not None:
+            copies.append(("dataset", PROBE_DATASET))
+            definitions[("dataset", PROBE_DATASET)] = probe.dataset
+        copies.append(root)
+        definitions[root] = probe.pipeline
+        plan = TempPlan(root, copies, definitions)
+
+        def job(j):
+            j.log(f"probe: {probe.description}")
+            result = execute(j, session, target, plan, None, 600, False, "linked_service_test")
+            run = result["run"]
+            out = {
+                "linked_service": name,
+                "type": definition.get("type"),
+                "source": store.label,
+                "probe": probe.description,
+                "connected": run.get("status") == "Succeeded",
+                "status": run.get("status"),
+                "duration": run.get("duration"),
+                "run_id": result["run_id"],
+            }
+            if run.get("status") == "Succeeded":
+                activity = query_activity_runs(client, target, {"runId": result["run_id"], "runStart": None, "runEnd": None}, limit=5)[0]
+                output = (activity[0].get("output") if activity else None) or {}
+                out["result"] = truncate({k: v for k, v in output.items() if k not in ("billingReference", "durationInQueue", "effectiveIntegrationRuntime")}, 800)
+                if isinstance(output, dict) and output.get("effectiveIntegrationRuntime"):
+                    out["integration_runtime"] = output["effectiveIntegrationRuntime"]
+            else:
+                failed = (run.get("failed_activities") or [{}])[0]
+                error = failed.get("error") or {}
+                out["error"] = error
+                out["category"], out["hint"] = classify(failed.get("type"), error.get("code"), error.get("message") or run.get("message"))
+            if probe.notes:
+                out["notes"] = probe.notes
+            return out
+
+        return run_job(session.jobs, "lstest", f"test linked service {name}", job, wait_seconds)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
     @handle_errors
@@ -409,7 +414,7 @@ def register(mcp: MCPServer) -> None:
         session_id: str | None = None,
         core_count: int = 8,
         time_to_live_minutes: int = 10,
-        wait_seconds: int = 60,
+        wait_seconds: int = 45,
         factory_name: str | None = None,
         resource_group: str | None = None,
     ) -> dict:
@@ -426,7 +431,7 @@ def register(mcp: MCPServer) -> None:
             )
             pending.append(poller)
             audit(target, "dataflow_debug_start", "dataflowDebugSession", {"core_count": core_count, "ttl": time_to_live_minutes})
-            poller.wait(max(0, wait_seconds))
+            poller.wait(bounded(wait_seconds))
             if poller.done():
                 return {"status": "ready", **poller.result().as_dict()}
             return {"status": "starting", "next": "Call adf_dataflow_debug_session action=list in a minute or two."}
@@ -460,12 +465,13 @@ def register(mcp: MCPServer) -> None:
         source: Source = "auto",
         ref: str | None = None,
         max_chars: int = 6000,
+        wait_seconds: int = 45,
         factory_name: str | None = None,
         resource_group: str | None = None,
     ) -> dict:
         """Preview rows of a data flow stream (a source or transformation name; default: first source) in a running
         debug session. Uses the data flow, datasets and linked services from `source` — so unpublished Git
-        versions can be previewed."""
+        versions can be previewed. Runs as a background job (previews often take 1-2 minutes)."""
         session, target, client = ctx(factory_name, resource_group)
         resolved = resolve_store(session, target, source, ref)
         package, sources = _debug_package(resolved.store, dataflow, row_limit)
@@ -478,29 +484,38 @@ def register(mcp: MCPServer) -> None:
         stream = stream_name or (sources[0] if sources else None)
         if not stream:
             raise AdfMcpError("bad_argument", "The data flow has no sources; pass stream_name.")
-        started = time.monotonic()
-        response = client.data_flow_debug_session.begin_execute_command(
-            rg,
-            factory,
-            {"sessionId": session_id, "command": "executePreviewQuery", "commandPayload": {"streamName": stream, "rowLimits": row_limit}},
-        ).result().as_dict()
-        data = response.get("data")
-        try:
-            data = json.loads(data) if isinstance(data, str) else data
-        except json.JSONDecodeError:
-            pass
-        out = {
-            "source": resolved.store.label,
-            "stream": stream,
-            "status": response.get("status"),
-            "seconds": round(time.monotonic() - started, 1),
-            "data": truncate(data, max_chars),
-        }
-        if response.get("status") != "Succeeded" and not data:
-            # ADF returns no error details for failed previews.
-            out["hint"] = (
-                "ADF gave no error details. Usual causes: the source is unreachable from the debug IR (network/firewall/DNS), "
-                "the debug IR's identity lacks access, or the stream name is wrong. Test the source with a pipeline "
-                "(e.g. GetMetadata via adf_pipeline_debug_run) to get the real error."
-            )
-        return out
+
+        def job(j):
+            started = time.monotonic()
+            j.log(f"previewing stream {stream}")
+            response = client.data_flow_debug_session.begin_execute_command(
+                rg,
+                factory,
+                {"sessionId": session_id, "command": "executePreviewQuery", "commandPayload": {"streamName": stream, "rowLimits": row_limit}},
+            ).result().as_dict()
+            return _preview_result(response, resolved.store.label, stream, time.monotonic() - started, max_chars)
+
+        return run_job(session.jobs, "dfpreview", f"preview {dataflow}.{stream}", job, wait_seconds)
+
+
+def _preview_result(response: dict, label: str, stream: str, seconds: float, max_chars: int) -> dict:
+    data = response.get("data")
+    try:
+        data = json.loads(data) if isinstance(data, str) else data
+    except json.JSONDecodeError:
+        pass
+    out = {
+        "source": label,
+        "stream": stream,
+        "status": response.get("status"),
+        "seconds": round(seconds, 1),
+        "data": truncate(data, max_chars),
+    }
+    if response.get("status") != "Succeeded" and not data:
+        # ADF returns no error details for failed previews.
+        out["hint"] = (
+            "ADF gave no error details. Usual causes: the source is unreachable from the debug IR (network/firewall/DNS), "
+            "the debug IR's identity lacks access, or the stream name is wrong. Test the source with a pipeline "
+            "(e.g. GetMetadata via adf_pipeline_debug_run) to get the real error."
+        )
+    return out

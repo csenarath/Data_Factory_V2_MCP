@@ -9,6 +9,7 @@ from ..auth import credential_key, token_identity
 from ..config import profiles_path
 from ..errors import AdfMcpError, handle_errors
 from ..guards import authoring_mode, git_repo_configuration
+from ..jobs import bounded
 from ..session import get_session
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -130,6 +131,24 @@ def register(mcp: MCPServer) -> None:
         if target_profile is None:
             raise AdfMcpError("unknown_profile", f"Profile '{profile}' not found.")
         return {"profile": target_profile.name, **session.logout(target_profile)}
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    @handle_errors
+    def adf_job_status(job_id: str, wait_seconds: int = 45) -> dict:
+        """Check a background job (debug run, publish, connection test, IR start/stop, ...). Waits up to
+        wait_seconds (capped) for it to finish, then returns its status, recent progress and result."""
+        job = get_session().jobs.get(job_id)
+        job.done.wait(bounded(wait_seconds))
+        out = job.view()
+        if job.status == "running":
+            out["next"] = f"Still running; call adf_job_status job_id={job.id} again."
+        return out
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    @handle_errors
+    def adf_jobs_list() -> dict:
+        """List this session's background jobs and their status."""
+        return {"jobs": [{k: v for k, v in j.view(progress_lines=1).items() if k != "result"} for j in get_session().jobs.all()]}
 
     @mcp.tool(annotations=READ)
     @handle_errors

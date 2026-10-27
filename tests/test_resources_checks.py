@@ -128,7 +128,7 @@ def test_classify_errors():
 
 
 def test_debug_copies_include_changed_dependencies_and_their_dependents():
-    from adf_mcp.tools.debug import _debug_copies, _rewrite
+    from adf_mcp.tempdeploy import debug_copies as _debug_copies, rewrite as _rewrite
 
     ls = {"type": "AzureBlobFS", "typeProperties": {"url": "https://new/"}}
     ds = {"type": "Parquet", "linkedServiceName": {"referenceName": "ls", "type": "LinkedServiceReference"}}

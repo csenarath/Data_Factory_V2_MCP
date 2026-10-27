@@ -21,6 +21,8 @@ from ..errors import AdfMcpError, handle_errors
 from ..gitrepo import GitRepo, pull_request_url
 from ..guards import audit, authoring_mode, check_write, git_repo_configuration, require_confirm_token
 from ..guards import confirm_token as make_confirm_token
+from ..jobs import run_job
+from ..publishing import apply_publish, plan_publish
 from ..resources import BUILTIN, KINDS, Kind, check_name, kind_of, normalize, references, same_definition
 from ..session import Session, Target
 from ..stores import GitStore, LiveStore, Source, git_repo, resolve_store
@@ -430,6 +432,116 @@ def register(mcp: MCPServer) -> None:
             updated = before != repo.git("rev-parse", "HEAD").strip()
         ahead, behind = repo.ahead_behind(branch, repo.base_ref())
         return {"branch": branch, "fast_forwarded": updated, "ahead": ahead, "behind": behind}
+
+    @mcp.tool(annotations=WRITE)
+    @handle_errors
+    def adf_global_parameters(
+        set_parameters: dict | None = None,
+        remove_parameters: list[str] | None = None,
+        dry_run: bool = True,
+        branch: str | None = None,
+        commit_message: str | None = None,
+        factory_name: str | None = None,
+        resource_group: str | None = None,
+    ) -> dict:
+        """Show or change factory global parameters. With no changes, returns them.
+        set_parameters: {name: {"type": "String|Int|Float|Bool|Array|Object", "value": ...}}.
+        Git factories: edits factory/<factory>.json on a feature branch (adf_publish deploys it); others: live.
+        dry_run=true (default) returns the diff."""
+        session, target, client = ctx(factory_name, resource_group)
+        mode = authoring_mode(session, target)
+        if mode == "git":
+            repo = git_repo(session, target)
+            current_branch = repo.current_branch()
+            branch = branch or (current_branch if current_branch != repo.collaboration_branch else f"{target.profile.git.branch_prefix}global-parameters")
+            ref = None if current_branch == branch else (branch if repo.ref_exists(branch) else repo.base_ref())
+            document = repo.factory_document(target.factory_name, ref) or {"name": target.factory_name, "properties": {}}
+            current = (document.get("properties") or {}).get("globalParameters") or {}
+            where = f"git branch {branch}"
+        else:
+            items = [g.as_dict() for g in client.global_parameters.list_by_factory(target.resource_group, target.factory_name)]
+            current = (items[0].get("properties") or {}) if items else {}
+            where = f"live factory {target.factory_name}"
+        if not set_parameters and not remove_parameters:
+            return {"mode": mode, "source": where, "global_parameters": current}
+        new = copy.deepcopy(current)
+        for name, spec in (set_parameters or {}).items():
+            if not isinstance(spec, dict) or "type" not in spec or "value" not in spec:
+                raise AdfMcpError("bad_argument", f"Global parameter '{name}' needs {{'type': ..., 'value': ...}}.")
+            new[name] = spec
+        for name in remove_parameters or []:
+            if name not in new:
+                raise AdfMcpError("not_found", f"Global parameter '{name}' does not exist.")
+            new.pop(name)
+        result: dict = {"mode": mode, "target": where, "dry_run": dry_run, "diff": _diff(current, new, "globalParameters")}
+        if dry_run or new == current:
+            result["next"] = "Call again with dry_run=false to apply." if new != current else "No change."
+            return result
+        check_write(target, "Update global parameters")
+        if mode == "git":
+            created = repo.ensure_branch(branch)
+            document = repo.factory_document(target.factory_name) or document
+            document.setdefault("properties", {})["globalParameters"] = new
+            path = repo.write_factory_document(target.factory_name, document)
+            commit = repo.commit([path], commit_message or "adf-mcp: update global parameters")
+            result.update(branch=branch, branch_created=created, commit=commit, note=PUBLISH_NOTE)
+        else:
+            client.global_parameters.create_or_update(target.resource_group, target.factory_name, "default", {"properties": new})
+        audit(target, "global_parameters_update", f"factory/{target.factory_name}/globalParameters", {"mode": mode, "set": sorted(set_parameters or {}), "removed": remove_parameters})
+        return result
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
+    @handle_errors
+    def adf_publish(
+        dry_run: bool = True,
+        confirm_token: str | None = None,
+        ref: str | None = None,
+        delete_removed: bool = False,
+        force: bool = False,
+        fetch: bool = True,
+        wait_seconds: int = 45,
+        factory_name: str | None = None,
+        resource_group: str | None = None,
+    ) -> dict:
+        """Publish the collaboration branch to the live factory — what ADF Studio's Publish button does.
+
+        dry_run=true (default) fetches origin, validates, and lists what would be created / updated (dependency
+        order) and which triggers are stopped and restarted, plus a confirm_token. Apply with dry_run=false and
+        that token. Triggers end in the runtimeState stored in Git; global parameters are published too.
+        delete_removed=true also deletes live resources that no longer exist in Git. Validation errors block
+        unless force=true. `ref` publishes another branch/commit (normally leave it to the collaboration branch).
+        Runs as a background job.
+        """
+        session, target, _ = ctx(factory_name, resource_group)
+        repo = _repo(session, target)
+        if fetch:
+            repo.fetch()
+        publish_ref = ref or repo.base_ref()
+        plan = plan_publish(session, target, repo, publish_ref, delete_removed)
+        summary = plan.summary()
+        parts = plan.token_parts()
+        if dry_run:
+            if summary["changes"] == 0:
+                return {**summary, "status": "nothing_to_publish"}
+            return {
+                **summary,
+                "confirm_token": make_confirm_token(target, *parts),
+                "next": ("Fix the validation errors or pass force=true. " if plan.errors else "")
+                + "Show this plan to the user; to publish call again with dry_run=false and confirm_token.",
+            }
+        if summary["changes"] == 0:
+            return {**summary, "status": "nothing_to_publish"}
+        require_confirm_token(target, confirm_token, *parts)
+        if plan.errors and not force:
+            raise AdfMcpError("validation_failed", f"{len(plan.errors)} validation error(s) in {publish_ref}; nothing was published.", "Fix them, or pass force=true.")
+        check_write(target, "Publish")
+
+        def job(j):
+            result = apply_publish(j, session, target, plan)
+            audit(target, "publish", f"factory/{target.factory_name}", {"commit": plan.commit, "deployed": len(result["deployed"]), "deleted": len(result["deleted"])})
+            return result
+
+        return run_job(session.jobs, "publish", f"publish {publish_ref}@{plan.commit}", job, wait_seconds)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
     @handle_errors
